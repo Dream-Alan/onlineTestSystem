@@ -1,0 +1,7 @@
+# 本地开发配置模板
+# 复制本文件为 application-local.yml 并填入真实数据库账号密码
+# application-local.yml 已被 .gitignore 忽略，不会提交到仓库
+spring:
+  datasource:
+    username: your_db_username
+    password: your_db_password
