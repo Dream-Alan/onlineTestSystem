@@ -14,6 +14,9 @@ public class ExamDetailResponse {
     private LocalDateTime startTime;
     private LocalDateTime endTime;
     private Boolean allowRetake;
+    private String composeType;
+    private Integer totalScore;
+    private List<RandomRuleItem> composeRule;
     private List<QuestionRef> questions;
 
     @Data

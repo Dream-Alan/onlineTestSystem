@@ -81,6 +81,7 @@ CREATE TABLE `exam` (
     `status` VARCHAR(20) NOT NULL DEFAULT 'draft' COMMENT 'draft | published',
     `allow_retake` TINYINT(1) NOT NULL DEFAULT 0,
     `compose_type` VARCHAR(20) NOT NULL DEFAULT 'manual' COMMENT 'manual | random',
+    `compose_rule` TEXT DEFAULT NULL COMMENT '随机组卷规则 JSON（仅 random 有效）',
     `total_score` INT NOT NULL DEFAULT 0,
     `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

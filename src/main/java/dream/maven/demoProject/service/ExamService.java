@@ -1,7 +1,9 @@
 package dream.maven.demoProject.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dream.maven.demoProject.common.BusinessException;
 import dream.maven.demoProject.common.PageResult;
@@ -11,6 +13,7 @@ import dream.maven.demoProject.entity.*;
 import dream.maven.demoProject.mapper.*;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
 import java.math.BigDecimal;
@@ -41,6 +44,20 @@ public class ExamService {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
+    private static final Map<String, String> TYPE_NAMES = Map.of(
+            "single", "单选题",
+            "multiple", "多选题",
+            "judge", "判断题",
+            "fill", "填空题",
+            "essay", "简答题");
+
+    private static final Map<String, Integer> TYPE_ORDER = Map.of(
+            "single", 0,
+            "multiple", 1,
+            "judge", 2,
+            "fill", 3,
+            "essay", 4);
+
     // ================= 教师端 =================
 
     public PageResult<ExamResponse> getExamList(Long courseId, String status, int page, int size) {
@@ -68,28 +85,65 @@ public class ExamService {
         response.setStartTime(exam.getStartTime());
         response.setEndTime(exam.getEndTime());
         response.setAllowRetake(exam.getAllowRetake());
+        response.setComposeType(exam.getComposeType());
+        response.setTotalScore(exam.getTotalScore());
+        response.setComposeRule(readRuleList(exam.getComposeRule()));
         response.setQuestions(examQuestions.stream()
                 .map(eq -> new ExamDetailResponse.QuestionRef(eq.getQuestionId(), eq.getOrderNum()))
                 .toList());
         return response;
     }
 
+    @Transactional
     public ExamResponse createExam(ExamRequest request) {
         Exam exam = new Exam();
         applyRequest(exam, request);
         exam.setStatus("draft");
         examMapper.insert(exam);
-        attachQuestions(exam, request);
+        if ("random".equals(exam.getComposeType())) {
+            randomAttachQuestions(exam, normalizeRule(request.getComposeRule()));
+        } else {
+            attachQuestions(exam, request);
+        }
         return toResponse(exam);
     }
 
+    @Transactional
     public void updateExam(Long id, ExamRequest request) {
         Exam exam = requireExam(id);
+        Long oldCourseId = exam.getCourseId();
+        String oldRuleJson = exam.getComposeRule();
+        boolean hadQuestions = countExamQuestions(id) > 0;
+
+        String targetType = request.getComposeType() != null ? request.getComposeType() : exam.getComposeType();
         applyRequest(exam, request);
         examMapper.updateById(exam);
-        if (request.getQuestionIds() != null) {
-            examQuestionMapper.delete(new LambdaQueryWrapper<ExamQuestion>().eq(ExamQuestion::getExamId, id));
-            attachQuestions(exam, request);
+
+        if ("random".equals(targetType)) {
+            // 未显式携带规则时视为未改动组卷规则，仅更新基本信息、保留现有抽题结果
+            if (request.getComposeRule() != null) {
+                List<RandomRuleItem> rule = normalizeRule(request.getComposeRule());
+                String newRuleJson = writeJson(rule);
+                boolean courseChanged = !Objects.equals(oldCourseId, exam.getCourseId());
+                boolean ruleChanged = !Objects.equals(oldRuleJson, newRuleJson);
+                if (courseChanged || ruleChanged || !hadQuestions) {
+                    if (hasExamRecords(id)) {
+                        throw new BusinessException(400, "考试已有作答记录，不能更换题目");
+                    }
+                    examQuestionMapper.delete(new LambdaQueryWrapper<ExamQuestion>().eq(ExamQuestion::getExamId, id));
+                    randomAttachQuestions(exam, rule);
+                }
+            }
+        } else if (request.getQuestionIds() != null) {
+            List<Long> questionIds = request.getQuestionIds();
+            if (!orderedQuestionIdsMatch(id, questionIds)) {
+                if (hasExamRecords(id)) {
+                    throw new BusinessException(400, "考试已有作答记录，不能更换题目");
+                }
+                examQuestionMapper.delete(new LambdaQueryWrapper<ExamQuestion>().eq(ExamQuestion::getExamId, id));
+                attachQuestions(exam, request);
+            }
+            clearComposeRule(id);
         }
     }
 
@@ -297,6 +351,92 @@ public class ExamService {
         return "fill".equals(type) || "essay".equals(type);
     }
 
+    /** 规则规范化：过滤未知题型/count<=0 行、难度空串归一 null、按固定题型序重排。 */
+    private List<RandomRuleItem> normalizeRule(List<RandomRuleItem> rule) {
+        if (rule == null || rule.isEmpty()) return Collections.emptyList();
+        return rule.stream()
+                .filter(Objects::nonNull)
+                .filter(it -> TYPE_ORDER.containsKey(it.getType()))
+                .filter(it -> it.getCount() != null && it.getCount() > 0)
+                .map(it -> {
+                    RandomRuleItem n = new RandomRuleItem();
+                    n.setType(it.getType());
+                    n.setCount(it.getCount());
+                    n.setDifficulty(StringUtils.hasText(it.getDifficulty()) ? it.getDifficulty() : null);
+                    return n;
+                })
+                .sorted(Comparator.comparingInt(it -> TYPE_ORDER.get(it.getType())))
+                .toList();
+    }
+
+    private List<RandomRuleItem> readRuleList(String json) {
+        if (!StringUtils.hasText(json)) return Collections.emptyList();
+        try {
+            return objectMapper.readValue(json, new TypeReference<List<RandomRuleItem>>() {});
+        } catch (Exception e) {
+            return Collections.emptyList();
+        }
+    }
+
+    /** 按随机规则抽题：先删后抽由调用方负责。题目按题型分组顺序赋 order_num。 */
+    private void randomAttachQuestions(Exam exam, List<RandomRuleItem> rule) {
+        List<Question> picked = new ArrayList<>();
+        for (RandomRuleItem item : rule) {
+            LambdaQueryWrapper<Question> wrapper = new LambdaQueryWrapper<Question>()
+                    .eq(Question::getCourseId, exam.getCourseId())
+                    .eq(Question::getType, item.getType());
+            if (StringUtils.hasText(item.getDifficulty())) {
+                wrapper.eq(Question::getDifficulty, item.getDifficulty());
+            }
+            List<Question> candidates = questionMapper.selectList(wrapper);
+            if (candidates.size() < item.getCount()) {
+                throw new BusinessException(400,
+                        TYPE_NAMES.getOrDefault(item.getType(), item.getType())
+                                + "题库数量不足：需要 " + item.getCount() + " 道，现有 " + candidates.size() + " 道");
+            }
+            Collections.shuffle(candidates);
+            picked.addAll(candidates.subList(0, item.getCount()));
+        }
+
+        int order = 1;
+        int totalScore = 0;
+        for (Question q : picked) {
+            ExamQuestion eq = new ExamQuestion();
+            eq.setExamId(exam.getId());
+            eq.setQuestionId(q.getId());
+            eq.setOrderNum(order++);
+            examQuestionMapper.insert(eq);
+            totalScore += q.getScore() == null ? 0 : q.getScore();
+        }
+        exam.setTotalScore(totalScore);
+        exam.setComposeRule(writeJson(rule));
+        examMapper.updateById(exam);
+    }
+
+    private long countExamQuestions(Long examId) {
+        return examQuestionMapper.selectCount(
+                new LambdaQueryWrapper<ExamQuestion>().eq(ExamQuestion::getExamId, examId));
+    }
+
+    private boolean hasExamRecords(Long examId) {
+        return examRecordMapper.selectCount(
+                new LambdaQueryWrapper<ExamRecord>().eq(ExamRecord::getExamId, examId)) > 0;
+    }
+
+    private boolean orderedQuestionIdsMatch(Long examId, List<Long> questionIds) {
+        List<Long> existing = examQuestionMapper.selectList(new LambdaQueryWrapper<ExamQuestion>()
+                        .eq(ExamQuestion::getExamId, examId)
+                        .orderByAsc(ExamQuestion::getOrderNum))
+                .stream().map(ExamQuestion::getQuestionId).toList();
+        return existing.equals(questionIds);
+    }
+
+    private void clearComposeRule(Long examId) {
+        examMapper.update(null, new LambdaUpdateWrapper<Exam>()
+                .eq(Exam::getId, examId)
+                .set(Exam::getComposeRule, null));
+    }
+
     @SuppressWarnings("unchecked")
     private boolean answerEquals(String type, Object userAnswer, Object correctAnswer) {
         if (userAnswer == null || correctAnswer == null) return false;
@@ -379,6 +519,8 @@ public class ExamService {
     private void attachQuestions(Exam exam, ExamRequest request) {
         List<Long> questionIds = request.getQuestionIds();
         if (questionIds == null || questionIds.isEmpty()) {
+            exam.setTotalScore(0);
+            examMapper.updateById(exam);
             return;
         }
         int order = 1;

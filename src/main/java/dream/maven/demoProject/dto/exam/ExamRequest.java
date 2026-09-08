@@ -15,4 +15,5 @@ public class ExamRequest {
     private String composeType;
     private Boolean allowRetake;
     private List<Long> questionIds;
+    private List<RandomRuleItem> composeRule;
 }

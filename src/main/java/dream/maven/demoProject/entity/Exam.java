@@ -20,6 +20,7 @@ public class Exam {
     private String status;
     private Boolean allowRetake;
     private String composeType;
+    private String composeRule;
     private Integer totalScore;
     private LocalDateTime createdAt;
 }
