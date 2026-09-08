@@ -32,6 +32,15 @@ public class QuestionController {
         return Result.success(questionService.getQuestionList(courseId, type, difficulty, page, size));
     }
 
+    @GetMapping("/template")
+    public ResponseEntity<byte[]> getQuestionTemplate() {
+        byte[] content = questionService.buildTemplate();
+        return ResponseEntity.ok()
+                .contentType(MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"question_template.xlsx\"")
+                .body(content);
+    }
+
     @GetMapping("/export")
     public ResponseEntity<byte[]> exportQuestions(
             @RequestParam(required = false) Long courseId,
