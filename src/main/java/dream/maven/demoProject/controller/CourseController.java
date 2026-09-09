@@ -4,6 +4,8 @@ import dream.maven.demoProject.common.PageResult;
 import dream.maven.demoProject.common.Result;
 import dream.maven.demoProject.dto.course.CourseRequest;
 import dream.maven.demoProject.dto.course.CourseResponse;
+import dream.maven.demoProject.dto.course.CourseStudentResponse;
+import dream.maven.demoProject.dto.course.CourseStudentsRequest;
 import dream.maven.demoProject.service.CourseService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
@@ -45,6 +47,30 @@ public class CourseController {
     public Result<Void> deleteCourse(@PathVariable Long id) {
         courseService.deleteCourse(id);
         return Result.success("删除成功", null);
+    }
+
+    @GetMapping("/{id}/students")
+    public Result<List<CourseStudentResponse>> getCourseStudents(@PathVariable Long id) {
+        return Result.success(courseService.listStudents(id));
+    }
+
+    @GetMapping("/{id}/students/available")
+    public Result<List<CourseStudentResponse>> getAvailableStudents(
+            @PathVariable Long id,
+            @RequestParam(required = false) String keyword) {
+        return Result.success(courseService.listAvailableStudents(id, keyword));
+    }
+
+    @PostMapping("/{id}/students")
+    public Result<Void> addStudents(@PathVariable Long id, @RequestBody CourseStudentsRequest request) {
+        courseService.addStudents(id, request.getStudentIds());
+        return Result.success("添加成功", null);
+    }
+
+    @DeleteMapping("/{id}/students/{studentId}")
+    public Result<Void> removeStudent(@PathVariable Long id, @PathVariable Long studentId) {
+        courseService.removeStudent(id, studentId);
+        return Result.success("移除成功", null);
     }
 
     @PostMapping("/{courseId}/enroll")
