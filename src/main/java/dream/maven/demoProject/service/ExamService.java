@@ -12,17 +12,20 @@ import dream.maven.demoProject.dto.exam.*;
 import dream.maven.demoProject.entity.*;
 import dream.maven.demoProject.mapper.*;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.*;
 
 @Service
-public class ExamService {
+public class
+ExamService {
 
     @Autowired
     private ExamMapper examMapper;
@@ -42,7 +45,13 @@ public class ExamService {
     @Autowired
     private ExamAnswerMapper examAnswerMapper;
 
+    @Autowired
+    private StringRedisTemplate stringRedisTemplate;
+
     private final ObjectMapper objectMapper = new ObjectMapper();
+
+    /** 答题暂存草稿在 Redis 中的 key 前缀（存整份 JSON 答案，交卷后删除）。 */
+    private static final String DRAFT_KEY_PREFIX = "exam:answer:draft:";
 
     private static final Map<String, String> TYPE_NAMES = Map.of(
             "single", "单选题",
@@ -264,15 +273,22 @@ public class ExamService {
         response.setStarted(true);
         response.setExam(new ExamBrief(exam.getId(), exam.getName(), exam.getDuration()));
         response.setQuestions(getStudentQuestionViews(examId));
-        response.setAnswers(parseAnswers(ongoing.getAnswersJson()));
+        response.setAnswers(parseAnswers(readDraft(ongoing)));
         response.setRemainingSeconds(remaining);
         return response;
     }
 
     public void saveAnswer(Long examId, AnswerSubmission submission) {
         ExamRecord record = requireOngoingRecord(examId);
-        record.setAnswersJson(writeJson(submission.getAnswers()));
-        examRecordMapper.updateById(record);
+        String json = writeJson(submission.getAnswers());
+        try {
+            Exam exam = requireExam(examId);
+            stringRedisTemplate.opsForValue().set(draftKey(record.getId()), json, draftTtl(exam, record));
+        } catch (Exception e) {
+            // Redis 不可用时降级写库，保证暂存不丢
+            record.setAnswersJson(json);
+            examRecordMapper.updateById(record);
+        }
     }
 
     public SubmitExamResponse submitExam(Long examId, AnswerSubmission submission) {
@@ -326,6 +342,7 @@ public class ExamService {
         record.setSubmitTime(LocalDateTime.now());
         record.setAnswersJson(writeJson(answers));
         examRecordMapper.updateById(record);
+        deleteDraft(record.getId());
 
         return new SubmitExamResponse(obtainedScore, accuracy, record.getId());
     }
@@ -496,6 +513,39 @@ public class ExamService {
             throw new BusinessException(400, "当前没有进行中的考试");
         }
         return record;
+    }
+
+    // ================= 答题暂存（Redis 草稿） =================
+
+    private String draftKey(Long recordId) {
+        return DRAFT_KEY_PREFIX + recordId;
+    }
+
+    /** 草稿 TTL：剩余考试时长（下限 60 秒），超时未交卷则草稿自动过期。 */
+    private Duration draftTtl(Exam exam, ExamRecord record) {
+        long elapsed = Duration.between(record.getStartTime(), LocalDateTime.now()).getSeconds();
+        long remaining = exam.getDuration() * 60L - elapsed;
+        return Duration.ofSeconds(Math.max(60, remaining));
+    }
+
+    /** 读草稿：优先 Redis，未命中或不可用时回退到 exam_record.answers_json。 */
+    private String readDraft(ExamRecord record) {
+        try {
+            String draft = stringRedisTemplate.opsForValue().get(draftKey(record.getId()));
+            if (draft != null) return draft;
+        } catch (Exception ignored) {
+            // Redis 不可用时回退读库
+        }
+        return record.getAnswersJson();
+    }
+
+    /** 交卷后清除草稿；失败仅忽略，交卷结果已落库。 */
+    private void deleteDraft(Long recordId) {
+        try {
+            stringRedisTemplate.delete(draftKey(recordId));
+        } catch (Exception ignored) {
+            // ignore
+        }
     }
 
     private Exam requireExam(Long id) {
